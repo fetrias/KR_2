@@ -1,6 +1,8 @@
+from uuid import uuid4
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr, Field
 
 
@@ -28,6 +30,30 @@ sample_products = [
     Product(product_id=101, name="Headphones", category="Accessories", price=99.0),
     Product(product_id=202, name="Smartwatch", category="Electronics", price=299.0),
 ]
+
+
+valid_credentials = {
+    "user123": "password123",
+}
+active_sessions: dict[str, str] = {}
+
+
+async def get_login_data(request: Request) -> tuple[str, str]:
+    content_type = request.headers.get("content-type", "")
+
+    if "application/json" in content_type:
+        payload = await request.json()
+    else:
+        form_data = await request.form()
+        payload = dict(form_data)
+
+    username = payload.get("username")
+    password = payload.get("password")
+
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="username and password required")
+
+    return str(username), str(password)
 
 
 @app.post("/create_user", response_model=UserCreate)
@@ -65,3 +91,29 @@ def get_product(product_id: int) -> Product:
             return product
 
     raise HTTPException(status_code=404, detail="Product not found")
+
+
+@app.post("/login")
+async def login(request: Request) -> JSONResponse:
+    username, password = await get_login_data(request)
+
+    if valid_credentials.get(username) != password:
+        return JSONResponse(status_code=401, content={"message": "Unauthorized"})
+
+    session_token = str(uuid4())
+    active_sessions[session_token] = username
+
+    response = JSONResponse(content={"message": "Login successful"})
+    response.set_cookie(key="session_token", value=session_token, httponly=True)
+    return response
+
+
+@app.get("/user")
+def user_profile(request: Request) -> JSONResponse:
+    session_token = request.cookies.get("session_token")
+
+    if not session_token or session_token not in active_sessions:
+        return JSONResponse(status_code=401, content={"message": "Unauthorized"})
+
+    username = active_sessions[session_token]
+    return JSONResponse(content={"username": username, "profile": "Authenticated user"})
