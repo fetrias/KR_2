@@ -3,11 +3,12 @@ from typing import Optional
 from time import time
 from uuid import UUID
 import re
+from datetime import datetime
 
-from fastapi import FastAPI, HTTPException, Header, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Header, Query, Request
 from fastapi.responses import JSONResponse
 from itsdangerous import BadSignature, Signer
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, ValidationError, field_validator
 
 
 app = FastAPI(title="KR2 FastAPI")
@@ -25,6 +26,18 @@ class Product(BaseModel):
     name: str
     category: str
     price: float
+
+
+class CommonHeaders(BaseModel):
+    user_agent: str = Field(alias="User-Agent")
+    accept_language: str = Field(alias="Accept-Language")
+
+    @field_validator("accept_language")
+    @classmethod
+    def validate_accept_language(cls, value: str) -> str:
+        if not is_valid_accept_language(value):
+            raise ValueError("Invalid Accept-Language format")
+        return value
 
 
 sample_products = [
@@ -105,6 +118,28 @@ def parse_session_token(session_token: str) -> tuple[str, int]:
 def is_valid_accept_language(value: str) -> bool:
     pattern = r"^[a-z]{2}(?:-[A-Z]{2})?(?:,\s*[a-z]{2}(?:-[A-Z]{2})?(?:;q=(?:0(?:\.\d+)?|1(?:\.0+)?))?)*$"
     return bool(re.fullmatch(pattern, value))
+
+
+def get_common_headers(
+    user_agent: Optional[str] = Header(default=None, alias="User-Agent"),
+    accept_language: Optional[str] = Header(default=None, alias="Accept-Language"),
+) -> CommonHeaders:
+    if not user_agent or not accept_language:
+        raise HTTPException(status_code=400, detail="Required headers are missing")
+
+    try:
+        return CommonHeaders.model_validate(
+            {
+                "User-Agent": user_agent,
+                "Accept-Language": accept_language,
+            }
+        )
+    except ValidationError as exc:
+        first_error = exc.errors()[0]
+        message = str(first_error.get("msg", "Invalid headers"))
+        if "Invalid Accept-Language format" in message:
+            message = "Invalid Accept-Language format"
+        raise HTTPException(status_code=400, detail=message) from exc
 
 
 @app.post("/create_user", response_model=UserCreate)
@@ -214,19 +249,25 @@ def user_profile(request: Request) -> JSONResponse:
 
 
 @app.get("/headers")
-def get_headers(
-    user_agent: Optional[str] = Header(default=None, alias="User-Agent"),
-    accept_language: Optional[str] = Header(default=None, alias="Accept-Language"),
-) -> JSONResponse:
-    if not user_agent or not accept_language:
-        raise HTTPException(status_code=400, detail="Required headers are missing")
-
-    if not is_valid_accept_language(accept_language):
-        raise HTTPException(status_code=400, detail="Invalid Accept-Language format")
-
+def get_headers(common_headers: CommonHeaders = Depends(get_common_headers)) -> JSONResponse:
     return JSONResponse(
         content={
-            "User-Agent": user_agent,
-            "Accept-Language": accept_language,
+            "User-Agent": common_headers.user_agent,
+            "Accept-Language": common_headers.accept_language,
         }
     )
+
+
+@app.get("/info")
+def get_info(common_headers: CommonHeaders = Depends(get_common_headers)) -> JSONResponse:
+    response = JSONResponse(
+        content={
+            "message": "Добро пожаловать! Ваши заголовки успешно обработаны.",
+            "headers": {
+                "User-Agent": common_headers.user_agent,
+                "Accept-Language": common_headers.accept_language,
+            },
+        }
+    )
+    response.headers["X-Server-Time"] = datetime.now().isoformat()
+    return response
