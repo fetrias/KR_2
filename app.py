@@ -2,8 +2,9 @@ from uuid import uuid4
 from typing import Optional
 from time import time
 from uuid import UUID
+import re
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Header, Query, Request
 from fastapi.responses import JSONResponse
 from itsdangerous import BadSignature, Signer
 from pydantic import BaseModel, EmailStr, Field
@@ -99,6 +100,11 @@ def parse_session_token(session_token: str) -> tuple[str, int]:
         raise HTTPException(status_code=401, detail="Invalid session")
 
     return user_id, timestamp
+
+
+def is_valid_accept_language(value: str) -> bool:
+    pattern = r"^[a-z]{2}(?:-[A-Z]{2})?(?:,\s*[a-z]{2}(?:-[A-Z]{2})?(?:;q=(?:0(?:\.\d+)?|1(?:\.0+)?))?)*$"
+    return bool(re.fullmatch(pattern, value))
 
 
 @app.post("/create_user", response_model=UserCreate)
@@ -205,3 +211,22 @@ def profile(request: Request) -> JSONResponse:
 @app.get("/user")
 def user_profile(request: Request) -> JSONResponse:
     return profile(request)
+
+
+@app.get("/headers")
+def get_headers(
+    user_agent: Optional[str] = Header(default=None, alias="User-Agent"),
+    accept_language: Optional[str] = Header(default=None, alias="Accept-Language"),
+) -> JSONResponse:
+    if not user_agent or not accept_language:
+        raise HTTPException(status_code=400, detail="Required headers are missing")
+
+    if not is_valid_accept_language(accept_language):
+        raise HTTPException(status_code=400, detail="Invalid Accept-Language format")
+
+    return JSONResponse(
+        content={
+            "User-Agent": user_agent,
+            "Accept-Language": accept_language,
+        }
+    )
