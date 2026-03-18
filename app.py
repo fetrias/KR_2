@@ -1,5 +1,7 @@
 from uuid import uuid4
 from typing import Optional
+from time import time
+from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
@@ -41,6 +43,9 @@ active_sessions: dict[str, str] = {}
 SECRET_KEY = "kr2-super-secret-key"
 signer = Signer(SECRET_KEY)
 
+SESSION_MAX_AGE_SECONDS = 300
+SESSION_REFRESH_AFTER_SECONDS = 180
+
 
 async def get_login_data(request: Request) -> tuple[str, str]:
     content_type = request.headers.get("content-type", "")
@@ -60,17 +65,40 @@ async def get_login_data(request: Request) -> tuple[str, str]:
     return str(username), str(password)
 
 
-def build_session_token(user_id: str) -> str:
-    return signer.sign(user_id.encode()).decode()
+def build_session_token(user_id: str, timestamp: int) -> str:
+    payload = f"{user_id}.{timestamp}"
+    signature = signer.get_signature(payload.encode()).decode()
+    return f"{payload}.{signature}"
 
 
-def parse_session_token(session_token: str) -> str:
+def parse_session_token(session_token: str) -> tuple[str, int]:
     try:
-        user_id = signer.unsign(session_token.encode()).decode()
-    except BadSignature as exc:
-        raise HTTPException(status_code=401, detail="Unauthorized") from exc
+        user_id, timestamp_raw, signature = session_token.rsplit(".", 2)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail="Invalid session") from exc
 
-    return user_id
+    signed_value = f"{user_id}.{timestamp_raw}.{signature}".encode()
+
+    try:
+        signer.unsign(signed_value)
+    except BadSignature as exc:
+        raise HTTPException(status_code=401, detail="Invalid session") from exc
+
+    try:
+        UUID(user_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail="Invalid session") from exc
+
+    if not timestamp_raw.isdigit():
+        raise HTTPException(status_code=401, detail="Invalid session")
+
+    timestamp = int(timestamp_raw)
+    current_timestamp = int(time())
+
+    if timestamp > current_timestamp:
+        raise HTTPException(status_code=401, detail="Invalid session")
+
+    return user_id, timestamp
 
 
 @app.post("/create_user", response_model=UserCreate)
@@ -119,14 +147,16 @@ async def login(request: Request) -> JSONResponse:
 
     user_id = str(uuid4())
     active_sessions[user_id] = username
-    session_token = build_session_token(user_id)
+    now_timestamp = int(time())
+    session_token = build_session_token(user_id, now_timestamp)
 
     response = JSONResponse(content={"message": "Login successful"})
     response.set_cookie(
         key="session_token",
         value=session_token,
         httponly=True,
-        max_age=3600,
+        secure=False,
+        max_age=SESSION_MAX_AGE_SECONDS,
     )
     return response
 
@@ -136,18 +166,40 @@ def profile(request: Request) -> JSONResponse:
     session_token = request.cookies.get("session_token")
 
     if not session_token:
-        return JSONResponse(status_code=401, content={"message": "Unauthorized"})
+        return JSONResponse(status_code=401, content={"message": "Invalid session"})
 
     try:
-        user_id = parse_session_token(session_token)
+        user_id, last_activity_timestamp = parse_session_token(session_token)
     except HTTPException:
-        return JSONResponse(status_code=401, content={"message": "Unauthorized"})
+        return JSONResponse(status_code=401, content={"message": "Invalid session"})
 
     username = active_sessions.get(user_id)
     if not username:
-        return JSONResponse(status_code=401, content={"message": "Unauthorized"})
+        return JSONResponse(status_code=401, content={"message": "Invalid session"})
 
-    return JSONResponse(content={"user_id": user_id, "username": username})
+    current_timestamp = int(time())
+    session_age = current_timestamp - last_activity_timestamp
+
+    if session_age > SESSION_MAX_AGE_SECONDS:
+        return JSONResponse(status_code=401, content={"message": "Session expired"})
+
+    response = JSONResponse(content={"user_id": user_id, "username": username})
+
+    should_refresh = (
+        SESSION_REFRESH_AFTER_SECONDS <= session_age < SESSION_MAX_AGE_SECONDS
+    )
+
+    if should_refresh:
+        refreshed_token = build_session_token(user_id, current_timestamp)
+        response.set_cookie(
+            key="session_token",
+            value=refreshed_token,
+            httponly=True,
+            secure=False,
+            max_age=SESSION_MAX_AGE_SECONDS,
+        )
+
+    return response
 
 
 @app.get("/user")
